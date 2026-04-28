@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+*.o
+*.a
+*.so
+
+# Local dependencies
+external/
+
+# Generated model artifacts and secrets
+artifacts/factor_mlp/*.pt
+artifacts/factor_mlp/*.npy
+artifacts/factor_mlp/*.bin
+artifacts/factor_mlp/*.enc
+artifacts/factor_mlp/*.key
+
+# Generated embedded blob may contain encrypted weights and the embedded key.
+# Keep the placeholder in source control, but do not commit generated changes.
+runtime/src/blob.cpp
+!artifacts/factor_mlp/model_info.yaml
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
