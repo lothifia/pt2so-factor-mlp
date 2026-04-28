@@ -1,0 +1,28 @@
+arch: factor_mlp_v1
+
+state_dict:
+  key: model
+  strip_prefix: []
+
+model_init:
+  num_features: 128
+  hidden1: 256
+  hidden2: 64
+  output_dim: 1
+  dropout: 0.1
+
+input:
+  count: 1
+  dtype: float32
+  shape: [-1, 128]
+  layout: BF
+
+output:
+  count: 1
+  dtype: float32
+  shape: [-1, 1]
+
+runtime:
+  backend: libtorch
+  device: cpu
+  precision: fp32
