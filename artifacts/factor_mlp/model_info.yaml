@@ -1,9 +1,4 @@
 arch: factor_mlp_v1
-
-state_dict:
-  key: model
-  strip_prefix: []
-
 model_init:
   num_features: 128
   hidden1: 256
@@ -23,6 +18,7 @@ output:
   shape: [-1, 1]
 
 runtime:
-  backend: libtorch
+  backend: libtorch_jit
   device: cpu
   precision: fp32
+  format: torchscript_trace
