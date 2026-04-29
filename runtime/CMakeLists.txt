@@ -18,10 +18,7 @@ endif()
 
 add_library(model SHARED
     ${PT2SO_BLOB_SOURCE}
-    src/factor_mlp.cpp
     src/model_api.cpp
-    src/state_dict.cpp
-    src/weight_pack.cpp
 )
 
 target_include_directories(model
