@@ -141,6 +141,7 @@ python tools/extract_weights.py
 python tools/encrypt_weights.py
 python tools/generate_blob.py
 
+chmod +x scripts/*.sh
 ./scripts/build_linux.sh
 export PT2SO_WEIGHTS_KEY_FILE="$PWD/artifacts/factor_mlp/weights.key"
 python tools/validate_ctypes.py
@@ -262,6 +263,7 @@ python tools/extract_weights.py
 python tools/encrypt_weights.py
 python tools/generate_blob.py
 
+chmod +x scripts/*.sh
 ./scripts/build_linux.sh
 ```
 
