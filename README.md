@@ -41,7 +41,7 @@ The shared library has no runtime dependency on external `.pt`, `.bin`, or `.enc
 ```text
 factor_mlp.pt
   -> weights.bin
-  -> AES-256-GCM weights.enc + weights.key
+  -> AES-256-GCM weights.enc + external weights.key
   -> runtime/src/blob.cpp with GNU assembler .incbin
   -> libmodel.so
 ```
@@ -52,21 +52,33 @@ At runtime:
 dlopen("libmodel.so")
   -> model_create()
   -> read embedded encrypted pack from .rodata
+  -> read AES key from PT2SO_WEIGHTS_KEY_HEX or PT2SO_WEIGHTS_KEY_FILE
   -> decrypt embedded blob in memory
   -> parse weights.bin format from memory
   -> strict-load C++ FactorMLP state_dict
 ```
 
-The AES key is embedded into `libmodel.so` so the library can be moved anywhere and still create the model without file paths. This is useful packaging and obfuscation, but it is not strong protection against someone who can reverse engineer the shared library.
+Only `weights.enc` is embedded into `libmodel.so`. The AES key is not compiled into the shared library. The caller must provide the key before calling `model_create()`:
+
+```bash
+export PT2SO_WEIGHTS_KEY_FILE=/secure/path/weights.key
+```
+
+or:
+
+```bash
+export PT2SO_WEIGHTS_KEY_HEX="$(xxd -p -c 256 /secure/path/weights.key)"
+```
+
+`PT2SO_WEIGHTS_KEY_FILE` may point to a raw 32-byte key file or a text file containing the 64-character hex key.
 
 `tools/generate_blob.py` does not convert binary data into a giant C++ array. It generates a small `runtime/src/blob.cpp` that uses GNU-style inline assembly:
 
 ```asm
 .incbin "/absolute/path/to/artifacts/factor_mlp/weights.enc"
-.incbin "/absolute/path/to/artifacts/factor_mlp/weights.key"
 ```
 
-Those bytes are linked into the shared object's read-only data section. After linking, `libmodel.so` no longer needs the source `.pt`, `weights.bin`, `weights.enc`, or `weights.key` files at runtime.
+The encrypted bytes are linked into the shared object's read-only data section. After linking, `libmodel.so` no longer needs the source `.pt`, `weights.bin`, or `weights.enc` files at runtime. It still needs the AES key supplied by environment variable or key file.
 
 ## Linux Build
 
@@ -130,6 +142,7 @@ python tools/encrypt_weights.py
 python tools/generate_blob.py
 
 ./scripts/build_linux.sh
+export PT2SO_WEIGHTS_KEY_FILE="$PWD/artifacts/factor_mlp/weights.key"
 python tools/validate_ctypes.py
 ```
 
@@ -150,4 +163,4 @@ const char* model_last_error(ModelHandle handle);
 const char* model_version();
 ```
 
-`model_create()` does not read any external weight path. It only uses encrypted data compiled into the shared library.
+`model_create()` does not read any external weight path. It only uses encrypted data compiled into the shared library, plus the AES key supplied through `PT2SO_WEIGHTS_KEY_HEX` or `PT2SO_WEIGHTS_KEY_FILE`.
