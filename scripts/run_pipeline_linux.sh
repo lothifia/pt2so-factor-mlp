@@ -8,18 +8,14 @@ ARTIFACT_DIR="${ROOT}/artifacts/factor_mlp"
 cd "${ROOT}"
 
 python tools/create_factor_mlp.py --output-dir "${ARTIFACT_DIR}"
-python tools/extract_weights.py \
-    --checkpoint "${ARTIFACT_DIR}/factor_mlp.pt" \
-    --model-info "${ARTIFACT_DIR}/model_info.yaml" \
-    --output "${ARTIFACT_DIR}/weights.bin"
-python tools/encrypt_weights.py \
-    --input "${ARTIFACT_DIR}/weights.bin" \
-    --output "${ARTIFACT_DIR}/weights.enc" \
-    --key-output "${ARTIFACT_DIR}/weights.key"
+python tools/encrypt_model.py \
+    --input "${ARTIFACT_DIR}/factor_mlp.pt" \
+    --output "${ARTIFACT_DIR}/model.pt.enc" \
+    --key-output "${ARTIFACT_DIR}/model.key"
 python tools/generate_blob.py \
-    --encrypted "${ARTIFACT_DIR}/weights.enc" \
+    --encrypted "${ARTIFACT_DIR}/model.pt.enc" \
     --output "${ROOT}/runtime/src/blob.cpp"
 
 "${SCRIPT_DIR}/build_linux.sh"
-export PT2SO_WEIGHTS_KEY_FILE="${ARTIFACT_DIR}/weights.key"
+export PT2SO_MODEL_KEY_FILE="${ARTIFACT_DIR}/model.key"
 python tools/validate_ctypes.py
