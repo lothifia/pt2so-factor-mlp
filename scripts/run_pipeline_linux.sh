@@ -18,8 +18,8 @@ python tools/encrypt_weights.py \
     --key-output "${ARTIFACT_DIR}/weights.key"
 python tools/generate_blob.py \
     --encrypted "${ARTIFACT_DIR}/weights.enc" \
-    --key "${ARTIFACT_DIR}/weights.key" \
     --output "${ROOT}/runtime/src/blob.cpp"
 
 "${SCRIPT_DIR}/build_linux.sh"
+export PT2SO_WEIGHTS_KEY_FILE="${ARTIFACT_DIR}/weights.key"
 python tools/validate_ctypes.py
