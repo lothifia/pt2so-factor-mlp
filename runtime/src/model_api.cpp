@@ -19,6 +19,7 @@
 
 namespace {
 
+constexpr uint8_t kEncryptedPackMagic[8] = {'P', 'T', '2', 'S', 'O', '_', 'E', '1'};
 constexpr int64_t kNumFeatures = 128;
 constexpr int64_t kHidden1 = 256;
 constexpr int64_t kHidden2 = 64;
@@ -84,25 +85,109 @@ struct EvpCipherCtxDeleter {
 
 using EvpCipherCtxPtr = std::unique_ptr<EVP_CIPHER_CTX, EvpCipherCtxDeleter>;
 
-std::vector<uint8_t> decrypt_embedded_weights() {
-    const uint8_t* encrypted = embedded_encrypted_weights_data();
-    const size_t encrypted_size = embedded_encrypted_weights_size();
-    const uint8_t* key = embedded_weights_key_data();
-    const size_t key_size = embedded_weights_key_size();
-    const uint8_t* nonce = embedded_weights_nonce_data();
-    const size_t nonce_size = embedded_weights_nonce_size();
+class ByteReader {
+public:
+    ByteReader(const uint8_t* data, size_t size) : data_(data), size_(size) {
+        if (data == nullptr && size != 0) {
+            throw std::runtime_error("embedded encrypted weights pack pointer is null");
+        }
+    }
 
-    if (encrypted == nullptr || encrypted_size == 0) {
-        throw std::runtime_error("embedded encrypted weights blob is empty");
+    const uint8_t* read_bytes(size_t n, const std::string& what) {
+        if (offset_ > size_ || n > size_ - offset_) {
+            std::ostringstream oss;
+            oss << "truncated embedded encrypted weights pack while reading " << what;
+            throw std::runtime_error(oss.str());
+        }
+        const uint8_t* out = data_ + offset_;
+        offset_ += n;
+        return out;
     }
-    if (key == nullptr || key_size != 32) {
-        throw std::runtime_error("embedded AES-256-GCM key must be exactly 32 bytes");
+
+    uint32_t read_u32(const std::string& what) {
+        const uint8_t* p = read_bytes(4, what);
+        return static_cast<uint32_t>(p[0]) |
+               (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) |
+               (static_cast<uint32_t>(p[3]) << 24);
     }
-    if (nonce == nullptr || nonce_size != 12) {
+
+    uint64_t read_u64(const std::string& what) {
+        const uint8_t* p = read_bytes(8, what);
+        uint64_t value = 0;
+        for (int i = 0; i < 8; ++i) {
+            value |= static_cast<uint64_t>(p[i]) << (8 * i);
+        }
+        return value;
+    }
+
+    size_t remaining() const {
+        return size_ - offset_;
+    }
+
+private:
+    const uint8_t* data_;
+    size_t size_;
+    size_t offset_{0};
+};
+
+struct EncryptedWeightsView {
+    const uint8_t* nonce{nullptr};
+    size_t nonce_size{0};
+    const uint8_t* ciphertext_and_tag{nullptr};
+    size_t ciphertext_and_tag_size{0};
+};
+
+EncryptedWeightsView parse_embedded_encrypted_pack() {
+    const uint8_t* pack = embedded_encrypted_weights_pack_data();
+    const size_t pack_size = embedded_encrypted_weights_pack_size();
+    if (pack == nullptr || pack_size == 0) {
+        throw std::runtime_error("embedded encrypted weights pack is empty");
+    }
+
+    ByteReader reader(pack, pack_size);
+    const uint8_t* magic = reader.read_bytes(8, "magic");
+    if (std::memcmp(magic, kEncryptedPackMagic, sizeof(kEncryptedPackMagic)) != 0) {
+        throw std::runtime_error("invalid embedded encrypted weights pack magic");
+    }
+
+    const uint32_t nonce_size = reader.read_u32("nonce_len");
+    const uint8_t* nonce = reader.read_bytes(nonce_size, "nonce");
+    const uint64_t ciphertext_size_u64 = reader.read_u64("ciphertext_len");
+    if (ciphertext_size_u64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        throw std::runtime_error("embedded ciphertext length overflows size_t");
+    }
+    const size_t ciphertext_size = static_cast<size_t>(ciphertext_size_u64);
+    const uint8_t* ciphertext_and_tag = reader.read_bytes(ciphertext_size, "ciphertext_and_tag");
+    if (reader.remaining() != 0) {
+        throw std::runtime_error("embedded encrypted weights pack has trailing bytes");
+    }
+    if (nonce_size != 12) {
         throw std::runtime_error("embedded AES-GCM nonce must be exactly 12 bytes");
     }
-    if (encrypted_size <= 16) {
-        throw std::runtime_error("embedded encrypted weights blob is too small to contain a GCM tag");
+    if (ciphertext_size <= 16) {
+        throw std::runtime_error("embedded ciphertext must include a 16-byte GCM tag");
+    }
+
+    return EncryptedWeightsView{
+        nonce,
+        nonce_size,
+        ciphertext_and_tag,
+        ciphertext_size,
+    };
+}
+
+std::vector<uint8_t> decrypt_embedded_weights() {
+    const EncryptedWeightsView encrypted_pack = parse_embedded_encrypted_pack();
+    const uint8_t* encrypted = encrypted_pack.ciphertext_and_tag;
+    const size_t encrypted_size = encrypted_pack.ciphertext_and_tag_size;
+    const uint8_t* key = embedded_weights_key_data();
+    const size_t key_size = embedded_weights_key_size();
+    const uint8_t* nonce = encrypted_pack.nonce;
+    const size_t nonce_size = encrypted_pack.nonce_size;
+
+    if (key == nullptr || key_size != 32) {
+        throw std::runtime_error("embedded AES-256-GCM key must be exactly 32 bytes");
     }
     if (encrypted_size - 16 > static_cast<size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("embedded encrypted weights blob is too large for OpenSSL EVP");
