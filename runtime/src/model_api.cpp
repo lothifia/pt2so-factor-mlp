@@ -1,7 +1,10 @@
 #include "model_api.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -48,6 +51,88 @@ int fail(ModelContext* ctx, int code, const std::string& message) {
         set_global_error(message);
     }
     return code;
+}
+
+int hex_value(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+std::vector<uint8_t> parse_hex_key(const std::string& value, const std::string& source) {
+    std::string compact;
+    compact.reserve(value.size());
+    for (unsigned char c : value) {
+        if (!std::isspace(c)) {
+            compact.push_back(static_cast<char>(c));
+        }
+    }
+
+    if (compact.rfind("0x", 0) == 0 || compact.rfind("0X", 0) == 0) {
+        compact.erase(0, 2);
+    }
+
+    if (compact.size() != 64) {
+        throw std::runtime_error(source + " must contain a 64-character AES-256 key in hex");
+    }
+
+    std::vector<uint8_t> key(32);
+    for (size_t i = 0; i < key.size(); ++i) {
+        const int hi = hex_value(compact[2 * i]);
+        const int lo = hex_value(compact[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            throw std::runtime_error(source + " contains a non-hex character");
+        }
+        key[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return key;
+}
+
+std::vector<uint8_t> read_all_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        throw std::runtime_error("failed to open PT2SO_WEIGHTS_KEY_FILE: " + path);
+    }
+
+    const std::streamsize file_size = f.tellg();
+    if (file_size < 0) {
+        throw std::runtime_error("failed to determine key file size: " + path);
+    }
+    f.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> bytes(static_cast<size_t>(file_size));
+    if (!bytes.empty() && !f.read(reinterpret_cast<char*>(bytes.data()), file_size)) {
+        throw std::runtime_error("failed to read key file: " + path);
+    }
+    return bytes;
+}
+
+std::vector<uint8_t> load_runtime_key() {
+    const char* hex_env = std::getenv("PT2SO_WEIGHTS_KEY_HEX");
+    if (hex_env != nullptr && hex_env[0] != '\0') {
+        return parse_hex_key(hex_env, "PT2SO_WEIGHTS_KEY_HEX");
+    }
+
+    const char* file_env = std::getenv("PT2SO_WEIGHTS_KEY_FILE");
+    if (file_env == nullptr || file_env[0] == '\0') {
+        throw std::runtime_error(
+            "missing AES key: set PT2SO_WEIGHTS_KEY_HEX or PT2SO_WEIGHTS_KEY_FILE before model_create");
+    }
+
+    std::vector<uint8_t> key_file = read_all_bytes(file_env);
+    if (key_file.size() == 32) {
+        return key_file;
+    }
+
+    const std::string maybe_hex(key_file.begin(), key_file.end());
+    return parse_hex_key(maybe_hex, "PT2SO_WEIGHTS_KEY_FILE");
 }
 
 size_t checked_bytes_for_float_tensor(int64_t rows, int64_t cols, const std::string& name) {
@@ -181,15 +266,15 @@ std::vector<uint8_t> decrypt_embedded_weights() {
     const EncryptedWeightsView encrypted_pack = parse_embedded_encrypted_pack();
     const uint8_t* encrypted = encrypted_pack.ciphertext_and_tag;
     const size_t encrypted_size = encrypted_pack.ciphertext_and_tag_size;
-    const uint8_t* key = embedded_weights_key_data();
-    const size_t key_size = embedded_weights_key_size();
+    std::vector<uint8_t> key = load_runtime_key();
     const uint8_t* nonce = encrypted_pack.nonce;
     const size_t nonce_size = encrypted_pack.nonce_size;
 
-    if (key == nullptr || key_size != 32) {
-        throw std::runtime_error("embedded AES-256-GCM key must be exactly 32 bytes");
+    if (key.size() != 32) {
+        throw std::runtime_error("runtime AES-256-GCM key must be exactly 32 bytes");
     }
     if (encrypted_size - 16 > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        OPENSSL_cleanse(key.data(), key.size());
         throw std::runtime_error("embedded encrypted weights blob is too large for OpenSSL EVP");
     }
 
@@ -199,18 +284,24 @@ std::vector<uint8_t> decrypt_embedded_weights() {
 
     EvpCipherCtxPtr ctx(EVP_CIPHER_CTX_new());
     if (!ctx) {
+        OPENSSL_cleanse(key.data(), key.size());
         throw std::runtime_error("failed to allocate OpenSSL EVP_CIPHER_CTX");
     }
 
     if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) {
+        OPENSSL_cleanse(key.data(), key.size());
         throw std::runtime_error("OpenSSL EVP_DecryptInit_ex failed");
     }
     if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce_size), nullptr) != 1) {
+        OPENSSL_cleanse(key.data(), key.size());
         throw std::runtime_error("OpenSSL failed to set AES-GCM nonce length");
     }
-    if (EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, key, nonce) != 1) {
+    if (EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), nonce) != 1) {
+        OPENSSL_cleanse(key.data(), key.size());
         throw std::runtime_error("OpenSSL failed to initialize AES-GCM key and nonce");
     }
+
+    OPENSSL_cleanse(key.data(), key.size());
 
     int out_len = 0;
     if (EVP_DecryptUpdate(
