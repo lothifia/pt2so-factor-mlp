@@ -25,7 +25,7 @@ artifacts/factor_mlp/*.bin
 artifacts/factor_mlp/*.enc
 artifacts/factor_mlp/*.key
 
-# Generated embedded blob may contain encrypted weights and the embedded key.
+# Generated embedded blob contains the encrypted TorchScript model.
 # Keep the placeholder in source control, but do not commit generated changes.
 runtime/src/blob.cpp
 !artifacts/factor_mlp/model_info.yaml
