@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import struct
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,110 +10,99 @@ DEFAULT_OUTPUT = ROOT / "runtime" / "src" / "blob.cpp"
 MAGIC = b"PT2SO_E1"
 
 
-def parse_encrypted_pack(path: Path) -> tuple[bytes, bytes]:
-    data = path.read_bytes()
-    offset = 0
-
-    def take(n: int, what: str) -> bytes:
-        nonlocal offset
-        if n < 0 or offset + n > len(data):
-            raise ValueError(f"truncated encrypted weights while reading {what}")
-        out = data[offset : offset + n]
-        offset += n
-        return out
-
-    magic = take(8, "magic")
-    if magic != MAGIC:
-        raise ValueError(f"invalid encrypted weights magic: {magic!r}")
-
-    nonce_len = struct.unpack("<I", take(4, "nonce_len"))[0]
-    nonce = take(nonce_len, "nonce")
-    ciphertext_len = struct.unpack("<Q", take(8, "ciphertext_len"))[0]
-    if ciphertext_len > len(data) - offset:
-        raise ValueError("ciphertext_len exceeds remaining encrypted weights file size")
-    ciphertext_and_tag = take(ciphertext_len, "ciphertext_and_tag")
-
-    if offset != len(data):
-        raise ValueError("encrypted weights file has trailing bytes")
-    if len(nonce) != 12:
-        raise ValueError("AES-GCM nonce must be 12 bytes")
-    if len(ciphertext_and_tag) <= 16:
-        raise ValueError("ciphertext must include at least one byte plus a 16-byte GCM tag")
-
-    return nonce, ciphertext_and_tag
+def asm_string_literal(path: Path) -> str:
+    text = path.resolve().as_posix()
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def format_cpp_array(name: str, data: bytes) -> str:
-    if not data:
-        return f"alignas(16) const uint8_t {name}[] = {{}};\n"
+def validate_inputs(encrypted_path: Path, key_path: Path) -> None:
+    encrypted = encrypted_path.read_bytes()
+    if len(encrypted) < 8 or encrypted[:8] != MAGIC:
+        raise ValueError(f"invalid encrypted weights magic in {encrypted_path}")
 
-    lines = [f"alignas(16) const uint8_t {name}[] = {{"]
-    for start in range(0, len(data), 12):
-        chunk = data[start : start + 12]
-        values = ", ".join(f"0x{byte:02x}" for byte in chunk)
-        lines.append(f"    {values},")
-    lines.append("};")
-    return "\n".join(lines) + "\n"
-
-
-def generate_blob(encrypted_path: Path, key_path: Path, output_path: Path) -> None:
-    nonce, ciphertext_and_tag = parse_encrypted_pack(encrypted_path)
     key = key_path.read_bytes()
     if len(key) != 32:
         raise ValueError("AES-256-GCM key file must contain exactly 32 bytes")
 
-    output = [
-        '#include "blob.h"',
-        "",
-        "namespace {",
-        "",
-        format_cpp_array("kEncryptedWeights", ciphertext_and_tag).rstrip(),
-        "",
-        format_cpp_array("kWeightsKey", key).rstrip(),
-        "",
-        format_cpp_array("kWeightsNonce", nonce).rstrip(),
-        "",
-        "}  // namespace",
-        "",
-        "const uint8_t* embedded_encrypted_weights_data() {",
-        "    return kEncryptedWeights;",
-        "}",
-        "",
-        "size_t embedded_encrypted_weights_size() {",
-        "    return sizeof(kEncryptedWeights);",
-        "}",
-        "",
-        "const uint8_t* embedded_weights_key_data() {",
-        "    return kWeightsKey;",
-        "}",
-        "",
-        "size_t embedded_weights_key_size() {",
-        "    return sizeof(kWeightsKey);",
-        "}",
-        "",
-        "const uint8_t* embedded_weights_nonce_data() {",
-        "    return kWeightsNonce;",
-        "}",
-        "",
-        "size_t embedded_weights_nonce_size() {",
-        "    return sizeof(kWeightsNonce);",
-        "}",
-        "",
-    ]
+
+def generate_blob(encrypted_path: Path, key_path: Path, output_path: Path) -> None:
+    validate_inputs(encrypted_path, key_path)
+
+    encrypted_incbin = asm_string_literal(encrypted_path)
+    key_incbin = asm_string_literal(key_path)
+
+    output = f'''#include "blob.h"
+
+extern "C" {{
+extern const uint8_t pt2so_encrypted_weights_pack_start[];
+extern const uint8_t pt2so_encrypted_weights_pack_end[];
+extern const uint8_t pt2so_weights_key_start[];
+extern const uint8_t pt2so_weights_key_end[];
+}}
+
+#if !defined(__GNUC__) && !defined(__clang__)
+#error "The embedded blob uses GNU-style inline assembly .incbin and requires GCC or Clang."
+#endif
+
+__asm__(
+    ".section .rodata.pt2so,\"a\",@progbits\n"
+    ".balign 16\n"
+    ".global pt2so_encrypted_weights_pack_start\n"
+    ".hidden pt2so_encrypted_weights_pack_start\n"
+    "pt2so_encrypted_weights_pack_start:\n"
+    ".incbin \"{encrypted_incbin}\"\n"
+    ".global pt2so_encrypted_weights_pack_end\n"
+    ".hidden pt2so_encrypted_weights_pack_end\n"
+    "pt2so_encrypted_weights_pack_end:\n"
+    ".size pt2so_encrypted_weights_pack_start, pt2so_encrypted_weights_pack_end - pt2so_encrypted_weights_pack_start\n"
+    ".balign 16\n"
+    ".global pt2so_weights_key_start\n"
+    ".hidden pt2so_weights_key_start\n"
+    "pt2so_weights_key_start:\n"
+    ".incbin \"{key_incbin}\"\n"
+    ".global pt2so_weights_key_end\n"
+    ".hidden pt2so_weights_key_end\n"
+    "pt2so_weights_key_end:\n"
+    ".size pt2so_weights_key_start, pt2so_weights_key_end - pt2so_weights_key_start\n"
+    ".previous\n"
+);
+
+const uint8_t* embedded_encrypted_weights_pack_data() {{
+    return pt2so_encrypted_weights_pack_start;
+}}
+
+size_t embedded_encrypted_weights_pack_size() {{
+    return static_cast<size_t>(
+        reinterpret_cast<uintptr_t>(pt2so_encrypted_weights_pack_end) -
+        reinterpret_cast<uintptr_t>(pt2so_encrypted_weights_pack_start));
+}}
+
+const uint8_t* embedded_weights_key_data() {{
+    return pt2so_weights_key_start;
+}}
+
+size_t embedded_weights_key_size() {{
+    return static_cast<size_t>(
+        reinterpret_cast<uintptr_t>(pt2so_weights_key_end) -
+        reinterpret_cast<uintptr_t>(pt2so_weights_key_start));
+}}
+'''
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(output), encoding="utf-8")
+    output_path.write_text(output, encoding="utf-8")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate runtime/src/blob.cpp from encrypted weights.")
+    parser = argparse.ArgumentParser(
+        description="Generate runtime/src/blob.cpp that embeds encrypted weights with .incbin."
+    )
     parser.add_argument("--encrypted", type=Path, default=ARTIFACT_DIR / "weights.enc")
     parser.add_argument("--key", type=Path, default=ARTIFACT_DIR / "weights.key")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
     generate_blob(args.encrypted, args.key, args.output)
-    print(f"generated_blob={args.output}")
+    print(f"generated_incbin_blob={args.output}")
 
 
 if __name__ == "__main__":
