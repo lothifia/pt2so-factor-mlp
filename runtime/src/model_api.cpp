@@ -1,5 +1,7 @@
 #include "model_api.h"
 
+#include <torch/script.h>
+
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -16,23 +18,17 @@
 #include <openssl/evp.h>
 
 #include "blob.h"
-#include "factor_mlp.h"
-#include "state_dict.h"
-#include "weight_pack.h"
 
 namespace {
 
-constexpr uint8_t kEncryptedPackMagic[8] = {'P', 'T', '2', 'S', 'O', '_', 'E', '1'};
+constexpr uint8_t kEncryptedModelMagic[8] = {'P', 'T', '2', 'S', 'O', '_', 'E', '1'};
 constexpr int64_t kNumFeatures = 128;
-constexpr int64_t kHidden1 = 256;
-constexpr int64_t kHidden2 = 64;
-constexpr int64_t kOutputDim = 1;
-constexpr double kDropout = 0.1;
+constexpr unsigned char kAad[] = "PT2SO_TORCHSCRIPT_V1";
 
 thread_local std::string g_last_error;
 
 struct ModelContext {
-    FactorMLP model{nullptr};
+    std::unique_ptr<torch::jit::Module> model;
     std::string last_error;
 };
 
@@ -95,10 +91,10 @@ std::vector<uint8_t> parse_hex_key(const std::string& value, const std::string& 
     return key;
 }
 
-std::vector<uint8_t> read_all_bytes(const std::string& path) {
+std::vector<uint8_t> read_all_bytes(const std::string& path, const std::string& env_name) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
-        throw std::runtime_error("failed to open PT2SO_WEIGHTS_KEY_FILE: " + path);
+        throw std::runtime_error("failed to open " + env_name + ": " + path);
     }
 
     const std::streamsize file_size = f.tellg();
@@ -114,25 +110,37 @@ std::vector<uint8_t> read_all_bytes(const std::string& path) {
     return bytes;
 }
 
+const char* first_nonempty_env(const char* primary, const char* fallback) {
+    const char* value = std::getenv(primary);
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    value = std::getenv(fallback);
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    return nullptr;
+}
+
 std::vector<uint8_t> load_runtime_key() {
-    const char* hex_env = std::getenv("PT2SO_WEIGHTS_KEY_HEX");
-    if (hex_env != nullptr && hex_env[0] != '\0') {
-        return parse_hex_key(hex_env, "PT2SO_WEIGHTS_KEY_HEX");
+    const char* hex_env = first_nonempty_env("PT2SO_MODEL_KEY_HEX", "PT2SO_WEIGHTS_KEY_HEX");
+    if (hex_env != nullptr) {
+        return parse_hex_key(hex_env, "PT2SO_MODEL_KEY_HEX");
     }
 
-    const char* file_env = std::getenv("PT2SO_WEIGHTS_KEY_FILE");
-    if (file_env == nullptr || file_env[0] == '\0') {
+    const char* file_env = first_nonempty_env("PT2SO_MODEL_KEY_FILE", "PT2SO_WEIGHTS_KEY_FILE");
+    if (file_env == nullptr) {
         throw std::runtime_error(
-            "missing AES key: set PT2SO_WEIGHTS_KEY_HEX or PT2SO_WEIGHTS_KEY_FILE before model_create");
+            "missing AES key: set PT2SO_MODEL_KEY_HEX or PT2SO_MODEL_KEY_FILE before model_create");
     }
 
-    std::vector<uint8_t> key_file = read_all_bytes(file_env);
+    std::vector<uint8_t> key_file = read_all_bytes(file_env, "PT2SO_MODEL_KEY_FILE");
     if (key_file.size() == 32) {
         return key_file;
     }
 
     const std::string maybe_hex(key_file.begin(), key_file.end());
-    return parse_hex_key(maybe_hex, "PT2SO_WEIGHTS_KEY_FILE");
+    return parse_hex_key(maybe_hex, "PT2SO_MODEL_KEY_FILE");
 }
 
 size_t checked_bytes_for_float_tensor(int64_t rows, int64_t cols, const std::string& name) {
@@ -174,14 +182,14 @@ class ByteReader {
 public:
     ByteReader(const uint8_t* data, size_t size) : data_(data), size_(size) {
         if (data == nullptr && size != 0) {
-            throw std::runtime_error("embedded encrypted weights pack pointer is null");
+            throw std::runtime_error("embedded encrypted model pointer is null");
         }
     }
 
     const uint8_t* read_bytes(size_t n, const std::string& what) {
         if (offset_ > size_ || n > size_ - offset_) {
             std::ostringstream oss;
-            oss << "truncated embedded encrypted weights pack while reading " << what;
+            oss << "truncated embedded encrypted model while reading " << what;
             throw std::runtime_error(oss.str());
         }
         const uint8_t* out = data_ + offset_;
@@ -216,24 +224,24 @@ private:
     size_t offset_{0};
 };
 
-struct EncryptedWeightsView {
+struct EncryptedModelView {
     const uint8_t* nonce{nullptr};
     size_t nonce_size{0};
     const uint8_t* ciphertext_and_tag{nullptr};
     size_t ciphertext_and_tag_size{0};
 };
 
-EncryptedWeightsView parse_embedded_encrypted_pack() {
-    const uint8_t* pack = embedded_encrypted_weights_pack_data();
-    const size_t pack_size = embedded_encrypted_weights_pack_size();
+EncryptedModelView parse_embedded_encrypted_model() {
+    const uint8_t* pack = embedded_encrypted_model_data();
+    const size_t pack_size = embedded_encrypted_model_size();
     if (pack == nullptr || pack_size == 0) {
-        throw std::runtime_error("embedded encrypted weights pack is empty");
+        throw std::runtime_error("embedded encrypted model is empty");
     }
 
     ByteReader reader(pack, pack_size);
     const uint8_t* magic = reader.read_bytes(8, "magic");
-    if (std::memcmp(magic, kEncryptedPackMagic, sizeof(kEncryptedPackMagic)) != 0) {
-        throw std::runtime_error("invalid embedded encrypted weights pack magic");
+    if (std::memcmp(magic, kEncryptedModelMagic, sizeof(kEncryptedModelMagic)) != 0) {
+        throw std::runtime_error("invalid embedded encrypted model magic");
     }
 
     const uint32_t nonce_size = reader.read_u32("nonce_len");
@@ -245,7 +253,7 @@ EncryptedWeightsView parse_embedded_encrypted_pack() {
     const size_t ciphertext_size = static_cast<size_t>(ciphertext_size_u64);
     const uint8_t* ciphertext_and_tag = reader.read_bytes(ciphertext_size, "ciphertext_and_tag");
     if (reader.remaining() != 0) {
-        throw std::runtime_error("embedded encrypted weights pack has trailing bytes");
+        throw std::runtime_error("embedded encrypted model has trailing bytes");
     }
     if (nonce_size != 12) {
         throw std::runtime_error("embedded AES-GCM nonce must be exactly 12 bytes");
@@ -254,7 +262,7 @@ EncryptedWeightsView parse_embedded_encrypted_pack() {
         throw std::runtime_error("embedded ciphertext must include a 16-byte GCM tag");
     }
 
-    return EncryptedWeightsView{
+    return EncryptedModelView{
         nonce,
         nonce_size,
         ciphertext_and_tag,
@@ -262,23 +270,22 @@ EncryptedWeightsView parse_embedded_encrypted_pack() {
     };
 }
 
-std::vector<uint8_t> decrypt_embedded_weights() {
-    const EncryptedWeightsView encrypted_pack = parse_embedded_encrypted_pack();
-    const uint8_t* encrypted = encrypted_pack.ciphertext_and_tag;
-    const size_t encrypted_size = encrypted_pack.ciphertext_and_tag_size;
+std::vector<uint8_t> decrypt_embedded_model() {
+    const EncryptedModelView encrypted_model = parse_embedded_encrypted_model();
+    const uint8_t* encrypted = encrypted_model.ciphertext_and_tag;
+    const size_t encrypted_size = encrypted_model.ciphertext_and_tag_size;
     std::vector<uint8_t> key = load_runtime_key();
-    const uint8_t* nonce = encrypted_pack.nonce;
-    const size_t nonce_size = encrypted_pack.nonce_size;
+    const uint8_t* nonce = encrypted_model.nonce;
+    const size_t nonce_size = encrypted_model.nonce_size;
 
     if (key.size() != 32) {
         throw std::runtime_error("runtime AES-256-GCM key must be exactly 32 bytes");
     }
     if (encrypted_size - 16 > static_cast<size_t>(std::numeric_limits<int>::max())) {
         OPENSSL_cleanse(key.data(), key.size());
-        throw std::runtime_error("embedded encrypted weights blob is too large for OpenSSL EVP");
+        throw std::runtime_error("embedded encrypted model is too large for OpenSSL EVP");
     }
 
-    constexpr unsigned char kAad[] = "PT2SO_FACTOR_MLP_V1";
     const size_t ciphertext_size = encrypted_size - 16;
     const uint8_t* tag = encrypted + ciphertext_size;
 
@@ -333,11 +340,26 @@ std::vector<uint8_t> decrypt_embedded_weights() {
 
     if (EVP_DecryptFinal_ex(ctx.get(), plaintext.data() + plaintext_len, &out_len) != 1) {
         OPENSSL_cleanse(plaintext.data(), plaintext.size());
-        throw std::runtime_error("embedded weights authentication failed");
+        throw std::runtime_error("embedded model authentication failed");
     }
     plaintext_len += out_len;
     plaintext.resize(static_cast<size_t>(plaintext_len));
     return plaintext;
+}
+
+std::unique_ptr<torch::jit::Module> load_jit_model_from_memory(const std::vector<uint8_t>& model_bytes) {
+    std::string model_string(reinterpret_cast<const char*>(model_bytes.data()), model_bytes.size());
+    try {
+        std::istringstream model_stream(model_string, std::ios::in | std::ios::binary);
+        auto module = std::make_unique<torch::jit::Module>(
+            torch::jit::load(model_stream, torch::Device(torch::kCPU)));
+        module->eval();
+        OPENSSL_cleanse(model_string.data(), model_string.size());
+        return module;
+    } catch (...) {
+        OPENSSL_cleanse(model_string.data(), model_string.size());
+        throw;
+    }
 }
 
 }  // namespace
@@ -352,19 +374,14 @@ int model_create(ModelHandle* out_handle) {
 
     try {
         auto ctx = std::make_unique<ModelContext>();
-        ctx->model = FactorMLP(kNumFeatures, kHidden1, kHidden2, kOutputDim, kDropout);
-
-        std::vector<uint8_t> decrypted_weights = decrypt_embedded_weights();
-        TensorMap weights;
+        std::vector<uint8_t> decrypted_model = decrypt_embedded_model();
         try {
-            weights = parse_weight_pack(decrypted_weights.data(), decrypted_weights.size());
+            ctx->model = load_jit_model_from_memory(decrypted_model);
         } catch (...) {
-            OPENSSL_cleanse(decrypted_weights.data(), decrypted_weights.size());
+            OPENSSL_cleanse(decrypted_model.data(), decrypted_model.size());
             throw;
         }
-        OPENSSL_cleanse(decrypted_weights.data(), decrypted_weights.size());
-        load_state_dict_strict(*ctx->model, weights);
-        ctx->model->eval();
+        OPENSSL_cleanse(decrypted_model.data(), decrypted_model.size());
         ctx->last_error.clear();
 
         *out_handle = reinterpret_cast<ModelHandle>(ctx.release());
@@ -384,8 +401,8 @@ int model_forward(
     TensorDesc* outputs,
     int output_count) {
     ModelContext* ctx = as_context(handle);
-    if (ctx == nullptr) {
-        return fail(nullptr, -1, "model_forward received null handle");
+    if (ctx == nullptr || ctx->model == nullptr) {
+        return fail(ctx, -1, "model_forward received null handle");
     }
 
     try {
@@ -446,7 +463,9 @@ int model_forward(
                 options);
         }
 
-        torch::Tensor y = ctx->model->forward(x);
+        std::vector<torch::jit::IValue> jit_inputs;
+        jit_inputs.emplace_back(x);
+        torch::Tensor y = ctx->model->forward(jit_inputs).toTensor();
         y = y.to(torch::kCPU).to(torch::kFloat32).contiguous();
         if (y.dim() != 2 || y.size(0) != batch || y.size(1) != 1) {
             throw std::runtime_error("model produced an unexpected output shape");
@@ -487,7 +506,7 @@ const char* model_last_error(ModelHandle handle) {
 }
 
 const char* model_version() {
-    return "pt2so-factor-mlp/0.1.0";
+    return "pt2so-factor-mlp/0.2.0-torchscript";
 }
 
 }
