@@ -12,23 +12,35 @@ class FactorMLP(nn.Module):
         hidden2: int = 64,
         output_dim: int = 1,
         dropout: float = 0.1,
+        depth: int | None = None,
+        hidden_dim: int | None = None,
     ):
         super().__init__()
-        self.fc1 = nn.Linear(num_features, hidden1)
-        self.ln1 = nn.LayerNorm(hidden1)
-        self.fc2 = nn.Linear(hidden1, hidden2)
-        self.ln2 = nn.LayerNorm(hidden2)
-        self.fc3 = nn.Linear(hidden2, output_dim)
-        self.dropout = nn.Dropout(dropout)
+        if depth is None and hidden_dim is None:
+            hidden_sizes = [hidden1, hidden2]
+        else:
+            depth = 2 if depth is None else depth
+            if depth < 1:
+                raise ValueError("depth must be >= 1")
+            width = hidden1 if hidden_dim is None else hidden_dim
+            hidden_sizes = [width] * depth
+
+        layers: list[nn.Module] = []
+        in_dim = num_features
+        for hidden_size in hidden_sizes:
+            if hidden_size < 1:
+                raise ValueError("hidden layer size must be >= 1")
+            layers.extend(
+                [
+                    nn.Linear(in_dim, hidden_size),
+                    nn.LayerNorm(hidden_size),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                ]
+            )
+            in_dim = hidden_size
+        layers.append(nn.Linear(in_dim, output_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = self.ln1(x)
-        x = torch.relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        x = self.ln2(x)
-        x = torch.relu(x)
-        x = self.dropout(x)
-        x = self.fc3(x)
-        return x
+        return self.net(x)
