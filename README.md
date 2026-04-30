@@ -123,6 +123,17 @@ export PT2SO_MODEL_KEY_FILE="$PWD/artifacts/factor_mlp/model.key"
 python tools/validate_ctypes.py
 ```
 
+如果你想生成更深、更大的测试模型，可以传入隐藏层数量和每层宽度：
+
+```bash
+python tools/create_factor_mlp.py --depth 8 --hidden-dim 1024
+python tools/encrypt_model.py
+python tools/generate_blob.py
+./scripts/build_linux.sh
+```
+
+`--depth 8` 表示 8 个隐藏层块，每个块是 `Linear -> LayerNorm -> ReLU -> Dropout`。`--hidden-dim 1024` 表示每个隐藏层宽度是 1024。输入仍然是 `[B, 128]`，输出仍然是 `[B, 1]`，所以 C++ runtime 不需要改。
+
 也可以用 hex 字符串提供 key：
 
 ```bash
