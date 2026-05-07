@@ -1,66 +1,108 @@
 # pt2so FactorMLP TorchScript Runtime
 
-这个工程现在的主链路是：上游用 `torch.jit.trace` 生成 TorchScript `.pt`，本项目把这个 `.pt` 加密后通过 `.incbin` 编译进 `libmodel.so`。运行时外部程序只需要 `dlopen` 这个 `.so`，设置独立保存的 AES key，然后调用 `model_create()` / `model_forward()`。
+这个工程把上游 `torch.jit.trace` 导出的 TorchScript `.pt` 加密后嵌入进 `libmodel.so`。运行时业务程序 `dlopen` 这个 `.so` 后直接调用：
 
-`.so` 不依赖外部 `.pt`、`.enc` 路径。key 不编译进 `.so`。
+```text
+model_create()
+model_forward()
+model_destroy()
+```
+
+当前版本：
+
+```text
+AES-128-GCM
+OpenSSL libcrypto.a 静态链接进 libmodel.so
+AES key 混淆后编译进 libmodel.so
+```
+
+部署环境不需要安装 `libssl-dev`，不需要 `libcrypto.so`，不需要 `libssl.so`，也不需要 `AF_ALG` 权限。
+
+注意：key 被混淆后内嵌在 `.so` 里，不会以明显的 `static uint8_t key[16]` 形式出现；但这仍然不是严格意义上的不可逆白盒安全。拿到 `.so` 的强逆向者仍可能通过调试或 dump 内存恢复模型或 key。
 
 ## Runtime Shape
 
-输入：
-
 ```text
-float32 [B, 128]
+input:  float32 [B, 128]
+output: float32 [B, 1]
 ```
 
-输出：
+`B` 是动态 batch size，`128` 是固定特征数。
+
+## Model
+
+默认 FactorMLP：
 
 ```text
-float32 [B, 1]
+Linear(128 -> 256)
+LayerNorm(256)
+ReLU
+Dropout(0.1)
+Linear(256 -> 64)
+LayerNorm(64)
+ReLU
+Dropout(0.1)
+Linear(64 -> 1)
 ```
 
-当前示例模型仍然是 FactorMLP，但 C++ runtime 不再手写这个网络结构，也不再解析 `state_dict`。真正执行的是 TorchScript module：
+导出方式：
 
-```cpp
-torch::jit::load(...)
-module.forward(...)
+```text
+torch.jit.trace(...)
+torch.jit.freeze(...)
+traced.save("factor_mlp.pt")
 ```
 
 ## Build Flow
 
-构建期流程：
+加密嵌入版本：
 
 ```text
-Python FactorMLP
-  -> torch.jit.trace(...)
-  -> artifacts/factor_mlp/factor_mlp.pt
-  -> AES-256-GCM 加密成 artifacts/factor_mlp/model.pt.enc
-  -> 生成 artifacts/factor_mlp/model.key
-  -> tools/generate_blob.py 生成 runtime/src/blob.cpp
-  -> .incbin 把 model.pt.enc 链进 libmodel.so
+factor_mlp.pt
+  -> tools/encrypt_model.py
+     1. 生成随机 AES-128 key K
+     2. 用 K 做 AES-128-GCM 加密，得到 weights.enc
+     3. 把 K 拆成 key shares
+     4. 每个 share 做 rotate / xor / add / reorder 编码
+     5. 生成 runtime/src/aes_key_obfuscated.cpp
+  -> tools/generate_blob.py
+     用 .incbin 把 weights.enc 嵌入 runtime/src/blob.cpp
+  -> scripts/build_linux.sh
+     静态链接 libcrypto.a，编译 libmodel.so
 ```
 
-运行期流程：
+运行阶段：
 
 ```text
-dlopen("libmodel.so")
-  -> model_create()
-  -> 从 .rodata 读取内嵌密文
-  -> 从 PT2SO_MODEL_KEY_FILE 或 PT2SO_MODEL_KEY_HEX 读取 key
-  -> 内存中 AES-GCM 解密 TorchScript .pt
-  -> torch::jit::load 从内存加载 module
-  -> model_forward() 调 module.forward()
+model_create()
+  -> 读取 embedded weights.enc
+  -> 从混淆 key shares 临时恢复 AES-128 key
+  -> OpenSSL EVP AES-128-GCM 解密并认证
+  -> torch::jit::load 从内存加载模型
+  -> 清理临时 key 和明文 buffer
 ```
+
+明文 baseline：
+
+```text
+factor_mlp.pt
+  -> tools/generate_blob.py --plaintext
+  -> runtime/src/blob.cpp 使用 .incbin 嵌入明文 .pt
+  -> libmodel.so
+```
+
+明文 baseline 也是把 `.pt` 编译进 `.so`，不是运行时从磁盘路径读取 `.pt`。
 
 ## Linux Setup
 
-安装系统依赖：
+构建环境需要 OpenSSL 头文件和 `libcrypto.a`。Ubuntu/Debian 上通常：
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake ninja-build libssl-dev python3 python3-venv
+sudo apt-get install -y build-essential cmake ninja-build libssl-dev python3 python3-venv binutils
 ```
 
-安装 Python 依赖：
+Python 环境：
 
 ```bash
 python3 -m venv .venv
@@ -69,140 +111,148 @@ pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-准备 CPU LibTorch，并设置环境变量，例如：
+LibTorch：
 
 ```bash
 export Torch_DIR="$PWD/external/libtorch/share/cmake/Torch"
 export LD_LIBRARY_PATH="$PWD/external/libtorch/lib:${LD_LIBRARY_PATH:-}"
 ```
 
+## Static OpenSSL
+
+默认构建：
+
+```text
+STATIC_OPENSSL=ON
+```
+
+也就是把 `libcrypto.a` 静态链接进 `libmodel.so`。部署环境不需要：
+
+```text
+libssl-dev
+libcrypto.so
+libssl.so
+```
+
+如果 CMake 没自动找到静态库，可以显式指定：
+
+```bash
+LIBCRYPTO_A=/path/to/libcrypto.a \
+OPENSSL_INCLUDE_DIR=/path/to/openssl/include \
+./scripts/build_linux.sh
+```
+
+`libcrypto.a` 需要能被链接进 shared library。如果链接时报 relocation / `-fPIC` 相关错误，需要换用带 PIC 编译的 OpenSSL 静态库。
+
+构建脚本会自动调用：
+
+```bash
+scripts/check_runtime_deps_linux.sh build/libmodel.so
+```
+
+如果 `readelf -d libmodel.so` 里出现 `libcrypto.so` 或 `libssl.so`，脚本会失败。
+
 ## One Command Pipeline
+
+第一次在 Linux 上如果脚本没有执行权限，先运行：
+
+```bash
+chmod +x scripts/*.sh
+```
+
+完整流程：
 
 ```bash
 source .venv/bin/activate
-chmod +x scripts/*.sh
 ./scripts/run_pipeline_linux.sh
 ```
 
-成功后会生成：
+默认生成：
 
 ```text
 artifacts/factor_mlp/factor_mlp.pt
 artifacts/factor_mlp/sample_input.npy
 artifacts/factor_mlp/expected_output.npy
-artifacts/factor_mlp/model.pt.enc
-artifacts/factor_mlp/model.key
+artifacts/factor_mlp/weights.enc
 runtime/src/blob.cpp
+runtime/src/aes_key_obfuscated.cpp
 build/libmodel.so
 ```
 
-验证通过时会看到：
+`runtime/src/aes_key_obfuscated.cpp` 含有混淆后的 key material，是生成产物，已经被 `.gitignore` 忽略，不建议提交。
 
-```text
-max_abs_error=...
-max_rel_error=...
-```
+## Manual Commands
 
-默认要求 `max_abs_error <= 1e-5`。
-
-## Manual Steps
-
-如果你想手动分步跑：
+也可以拆开跑：
 
 ```bash
-source .venv/bin/activate
+python tools/create_factor_mlp.py --output-dir artifacts/factor_mlp
 
-python tools/create_factor_mlp.py
-python tools/encrypt_model.py
-python tools/generate_blob.py
+python tools/encrypt_model.py \
+  --input artifacts/factor_mlp/factor_mlp.pt \
+  --output artifacts/factor_mlp/weights.enc \
+  --key-source runtime/src/aes_key_obfuscated.cpp
 
-chmod +x scripts/*.sh
+python tools/generate_blob.py \
+  --encrypted artifacts/factor_mlp/weights.enc \
+  --output runtime/src/blob.cpp
+
 ./scripts/build_linux.sh
-
-export PT2SO_MODEL_KEY_FILE="$PWD/artifacts/factor_mlp/model.key"
 python tools/validate_ctypes.py
 ```
 
-如果你想生成更深、更大的测试模型，可以传入隐藏层数量和每层宽度：
+调整 key share 数量：
 
 ```bash
-python tools/create_factor_mlp.py --depth 8 --hidden-dim 1024
-python tools/encrypt_model.py
-python tools/generate_blob.py
-./scripts/build_linux.sh
+python tools/encrypt_model.py \
+  --input artifacts/factor_mlp/factor_mlp.pt \
+  --output artifacts/factor_mlp/weights.enc \
+  --key-source runtime/src/aes_key_obfuscated.cpp \
+  --key-share-count 8
 ```
 
-`--depth 8` 表示 8 个隐藏层块，每个块是 `Linear -> LayerNorm -> ReLU -> Dropout`。`--hidden-dim 1024` 表示每个隐藏层宽度是 1024。输入仍然是 `[B, 128]`，输出仍然是 `[B, 1]`，所以 C++ runtime 不需要改。
+## Benchmark
 
-也可以用 hex 字符串提供 key：
+比较“明文嵌入直接 load”和“AES-128-GCM 解密后 load”：
 
 ```bash
-export PT2SO_MODEL_KEY_HEX="$(xxd -p -c 256 artifacts/factor_mlp/model.key)"
+REPEAT=10 WARMUP=2 ./scripts/benchmark_crypto_linux.sh
 ```
 
-兼容旧名字：runtime 里也临时支持 `PT2SO_WEIGHTS_KEY_FILE` 和 `PT2SO_WEIGHTS_KEY_HEX`，但新代码建议统一使用 `PT2SO_MODEL_*`。
-
-## incbin
-
-`tools/generate_blob.py` 会生成 `runtime/src/blob.cpp`，核心是 GNU assembler 的 `.incbin`：
-
-```asm
-.incbin "/absolute/path/to/artifacts/factor_mlp/model.pt.enc"
-```
-
-这表示链接 `libmodel.so` 时，把加密后的 TorchScript 文件原样放进 `.so` 的只读数据段。链接完成后，运行时不再需要 `factor_mlp.pt` 或 `model.pt.enc` 的文件路径。
-
-注意：只把 `model.pt.enc` 编译进 `.so`，不会把 `model.key` 编译进去。
-
-## C ABI
-
-导出的接口在 `runtime/include/model_api.h`：
-
-```c
-int model_create(ModelHandle* out_handle);
-
-int model_forward(
-    ModelHandle handle,
-    const TensorDesc* inputs,
-    int input_count,
-    TensorDesc* outputs,
-    int output_count);
-
-void model_destroy(ModelHandle handle);
-const char* model_last_error(ModelHandle handle);
-const char* model_version();
-```
-
-`model_forward()` 目前只支持：
+输出：
 
 ```text
-1 个输入，float32 [B, 128]
-1 个输出，float32 [B, 1]
-CPU inference
+artifacts/crypto_bench/results.csv
 ```
 
-## dlopen Test
-
-项目里有一套 Python vs C++ dlopen 对比工具：
-
-```bash
-python tools/run_python_pt_reference.py
-
-g++ -std=c++17 -O2 -Iruntime/include tools/run_dlopen_model.cpp -ldl -o build/run_dlopen_model
-
-export PT2SO_MODEL_KEY_FILE=artifacts/factor_mlp/model.key
-./build/run_dlopen_model --lib build/libmodel.so
-
-python tools/compare_reference_outputs.py
-```
-
-输出文件：
+字段含义：
 
 ```text
-artifacts/factor_mlp/python_pt_output.npy
-artifacts/factor_mlp/cpp_dlopen_output.npy
-artifacts/factor_mlp/python_vs_cpp_report.txt
+algorithm                  当前 case 名称，plaintext-embedded 或 gcm-aes-128
+iteration                  第几次正式计时，不包含 warmup
+encrypted_bytes            嵌入的 AES-GCM 包大小；明文 baseline 为 0
+plaintext_bytes            解密后 TorchScript .pt 字节数
+decrypt_ms                 C++ 中恢复混淆 key 并做 AES-128-GCM 解密/认证耗时
+jit_load_ms                torch::jit::load 从内存加载 TorchScript 的耗时
+total_create_inner_ms      model_create() 内部总耗时
+total_create_wall_ms       benchmark 进程在外部测得的 create 调用墙钟耗时
 ```
+
+## Bigger Model
+
+增大模型深度和宽度：
+
+```bash
+MODEL_ARGS="--depth 16 --hidden-dim 2048" REPEAT=10 WARMUP=2 ./scripts/benchmark_crypto_linux.sh
+```
+
+增大样例 batch：
+
+```bash
+python tools/create_factor_mlp.py --batch-size 4096 --output-dir artifacts/factor_mlp
+```
+
+输入仍然是 `[B, 128]`，输出仍然是 `[B, 1]`。调大 `depth`、`hidden-dim` 会增大模型文件，适合放大加载和解密时间差异。
 
 ## Deployment
 
@@ -210,70 +260,16 @@ artifacts/factor_mlp/python_vs_cpp_report.txt
 
 ```text
 libmodel.so
-model.key
+LibTorch runtime libraries
 ```
 
 不需要部署：
 
 ```text
 factor_mlp.pt
-model.pt.enc
-sample_input.npy
-expected_output.npy
+weights.enc
 runtime/src/blob.cpp
-```
-
-示例：
-
-```bash
-export LD_LIBRARY_PATH="/path/to/libtorch/lib:${LD_LIBRARY_PATH:-}"
-export PT2SO_MODEL_KEY_FILE=/secure/path/model.key
-```
-
-然后你的业务程序再 `dlopen("/path/to/libmodel.so")`。
-
-## Security Notes
-
-`libmodel.so` 里只有密文，没有 key。请不要把 `model.key` 提交到 Git，也不要放进公开镜像或公开下载路径。
-
-当前 `.gitignore` 已经排除：
-
-```text
-artifacts/factor_mlp/*.pt
-artifacts/factor_mlp/*.npy
-artifacts/factor_mlp/*.bin
-artifacts/factor_mlp/*.enc
-artifacts/factor_mlp/*.key
-runtime/src/blob.cpp
-build/
-*.so
-```
-
-## Troubleshooting
-
-如果脚本提示 `Permission denied`：
-
-```bash
-chmod +x scripts/*.sh
-```
-
-如果 `model_create()` 提示 key 缺失：
-
-```bash
-echo "$PT2SO_MODEL_KEY_FILE"
-echo "$PT2SO_MODEL_KEY_HEX"
-```
-
-如果解密失败，通常是当前 `model.key` 和编译进 `.so` 的 `model.pt.enc` 不是同一轮生成的。
-
-如果加载 `.so` 失败，检查：
-
-```bash
-export LD_LIBRARY_PATH="$PWD/external/libtorch/lib:${LD_LIBRARY_PATH:-}"
-```
-
-如果 CMake 找不到 LibTorch，检查：
-
-```bash
-echo "$Torch_DIR"
+runtime/src/aes_key_obfuscated.cpp
+libcrypto.so
+libssl.so
 ```

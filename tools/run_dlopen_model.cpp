@@ -255,9 +255,7 @@ void print_usage(const char* argv0) {
         << " [--input artifacts/factor_mlp/sample_input.npy]"
         << " [--output artifacts/factor_mlp/cpp_dlopen_output.npy]\n\n"
         << "Compile example:\n"
-        << "  g++ -std=c++17 -O2 -Iruntime/include tools/run_dlopen_model.cpp -ldl -o build/run_dlopen_model\n\n"
-        << "Runtime key example:\n"
-        << "  export PT2SO_MODEL_KEY_FILE=artifacts/factor_mlp/model.key\n";
+        << "  g++ -std=c++17 -O2 -Iruntime/include tools/run_dlopen_model.cpp -ldl -o build/run_dlopen_model\n";
 }
 
 }  // namespace

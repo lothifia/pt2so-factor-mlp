@@ -10,12 +10,11 @@ cd "${ROOT}"
 python tools/create_factor_mlp.py --output-dir "${ARTIFACT_DIR}"
 python tools/encrypt_model.py \
     --input "${ARTIFACT_DIR}/factor_mlp.pt" \
-    --output "${ARTIFACT_DIR}/model.pt.enc" \
-    --key-output "${ARTIFACT_DIR}/model.key"
+    --output "${ARTIFACT_DIR}/weights.enc" \
+    --key-source "${ROOT}/runtime/src/aes_key_obfuscated.cpp"
 python tools/generate_blob.py \
-    --encrypted "${ARTIFACT_DIR}/model.pt.enc" \
+    --encrypted "${ARTIFACT_DIR}/weights.enc" \
     --output "${ROOT}/runtime/src/blob.cpp"
 
 "${SCRIPT_DIR}/build_linux.sh"
-export PT2SO_MODEL_KEY_FILE="${ARTIFACT_DIR}/model.key"
 python tools/validate_ctypes.py

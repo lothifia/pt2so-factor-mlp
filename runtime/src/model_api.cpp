@@ -2,38 +2,84 @@
 
 #include <torch/script.h>
 
-#include <cctype>
-#include <cstdlib>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+
+#include <array>
+#include <chrono>
 #include <cstring>
 #include <exception>
-#include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-
 #include "blob.h"
+#include "embedded_key.h"
 
 namespace {
 
-constexpr uint8_t kEncryptedModelMagic[8] = {'P', 'T', '2', 'S', 'O', '_', 'E', '1'};
+constexpr uint8_t kEncryptedModelMagicV2[8] = {'P', 'T', '2', 'S', 'O', '_', 'E', '2'};
+constexpr uint8_t kPlaintextModelMagicV1[8] = {'P', 'T', '2', 'S', 'O', '_', 'P', '1'};
+constexpr uint32_t kAes128GcmAlgorithmId = 7;
 constexpr int64_t kNumFeatures = 128;
+constexpr size_t kAes128KeyBytes = 16;
+constexpr size_t kGcmNonceBytes = 12;
+constexpr size_t kGcmTagBytes = 16;
 constexpr unsigned char kAad[] = "PT2SO_TORCHSCRIPT_V1";
 
+using Clock = std::chrono::steady_clock;
+
 thread_local std::string g_last_error;
+
+struct CreateTiming {
+    std::string algorithm;
+    size_t encrypted_bytes{0};
+    size_t plaintext_bytes{0};
+    double decrypt_ms{0.0};
+    double jit_load_ms{0.0};
+    double total_ms{0.0};
+};
 
 struct ModelContext {
     std::unique_ptr<torch::jit::Module> model;
     std::string last_error;
+    CreateTiming create_timing;
 };
+
+struct ModelBlob {
+    std::vector<uint8_t> plaintext;
+    std::string algorithm;
+    size_t encrypted_pack_bytes{0};
+    size_t plaintext_bytes{0};
+    bool encrypted{true};
+};
+
+struct EncryptedModelView {
+    const uint8_t* nonce{nullptr};
+    size_t nonce_size{0};
+    const uint8_t* ciphertext_and_tag{nullptr};
+    size_t ciphertext_and_tag_size{0};
+    size_t pack_size{0};
+};
+
+struct EvpCipherCtxDeleter {
+    void operator()(EVP_CIPHER_CTX* ctx) const {
+        EVP_CIPHER_CTX_free(ctx);
+    }
+};
+
+using EvpCipherCtxPtr = std::unique_ptr<EVP_CIPHER_CTX, EvpCipherCtxDeleter>;
 
 ModelContext* as_context(ModelHandle handle) {
     return reinterpret_cast<ModelContext*>(handle);
+}
+
+double elapsed_ms(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 void set_global_error(const std::string& message) {
@@ -49,98 +95,32 @@ int fail(ModelContext* ctx, int code, const std::string& message) {
     return code;
 }
 
-int hex_value(char c) {
-    if (c >= '0' && c <= '9') {
-        return c - '0';
-    }
-    if (c >= 'a' && c <= 'f') {
-        return c - 'a' + 10;
-    }
-    if (c >= 'A' && c <= 'F') {
-        return c - 'A' + 10;
-    }
-    return -1;
-}
-
-std::vector<uint8_t> parse_hex_key(const std::string& value, const std::string& source) {
-    std::string compact;
-    compact.reserve(value.size());
-    for (unsigned char c : value) {
-        if (!std::isspace(c)) {
-            compact.push_back(static_cast<char>(c));
+void init_openssl_crypto() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        if (OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1) {
+            throw std::runtime_error("OpenSSL crypto initialization failed");
         }
-    }
-
-    if (compact.rfind("0x", 0) == 0 || compact.rfind("0X", 0) == 0) {
-        compact.erase(0, 2);
-    }
-
-    if (compact.size() != 64) {
-        throw std::runtime_error(source + " must contain a 64-character AES-256 key in hex");
-    }
-
-    std::vector<uint8_t> key(32);
-    for (size_t i = 0; i < key.size(); ++i) {
-        const int hi = hex_value(compact[2 * i]);
-        const int lo = hex_value(compact[2 * i + 1]);
-        if (hi < 0 || lo < 0) {
-            throw std::runtime_error(source + " contains a non-hex character");
-        }
-        key[i] = static_cast<uint8_t>((hi << 4) | lo);
-    }
-    return key;
+    });
 }
 
-std::vector<uint8_t> read_all_bytes(const std::string& path, const std::string& env_name) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
-        throw std::runtime_error("failed to open " + env_name + ": " + path);
+void secure_clear(void* data, size_t size) {
+    if (data == nullptr || size == 0) {
+        return;
     }
-
-    const std::streamsize file_size = f.tellg();
-    if (file_size < 0) {
-        throw std::runtime_error("failed to determine key file size: " + path);
-    }
-    f.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> bytes(static_cast<size_t>(file_size));
-    if (!bytes.empty() && !f.read(reinterpret_cast<char*>(bytes.data()), file_size)) {
-        throw std::runtime_error("failed to read key file: " + path);
-    }
-    return bytes;
+    OPENSSL_cleanse(data, size);
 }
 
-const char* first_nonempty_env(const char* primary, const char* fallback) {
-    const char* value = std::getenv(primary);
-    if (value != nullptr && value[0] != '\0') {
-        return value;
+void secure_clear(std::vector<uint8_t>& bytes) {
+    if (!bytes.empty()) {
+        secure_clear(bytes.data(), bytes.size());
     }
-    value = std::getenv(fallback);
-    if (value != nullptr && value[0] != '\0') {
-        return value;
-    }
-    return nullptr;
 }
 
-std::vector<uint8_t> load_runtime_key() {
-    const char* hex_env = first_nonempty_env("PT2SO_MODEL_KEY_HEX", "PT2SO_WEIGHTS_KEY_HEX");
-    if (hex_env != nullptr) {
-        return parse_hex_key(hex_env, "PT2SO_MODEL_KEY_HEX");
+void secure_clear(std::string& value) {
+    if (!value.empty()) {
+        secure_clear(&value[0], value.size());
     }
-
-    const char* file_env = first_nonempty_env("PT2SO_MODEL_KEY_FILE", "PT2SO_WEIGHTS_KEY_FILE");
-    if (file_env == nullptr) {
-        throw std::runtime_error(
-            "missing AES key: set PT2SO_MODEL_KEY_HEX or PT2SO_MODEL_KEY_FILE before model_create");
-    }
-
-    std::vector<uint8_t> key_file = read_all_bytes(file_env, "PT2SO_MODEL_KEY_FILE");
-    if (key_file.size() == 32) {
-        return key_file;
-    }
-
-    const std::string maybe_hex(key_file.begin(), key_file.end());
-    return parse_hex_key(maybe_hex, "PT2SO_MODEL_KEY_FILE");
 }
 
 size_t checked_bytes_for_float_tensor(int64_t rows, int64_t cols, const std::string& name) {
@@ -170,26 +150,18 @@ void fill_output_desc_shape(TensorDesc& output, int64_t batch) {
     output.bytes = checked_bytes_for_float_tensor(batch, 1, "output");
 }
 
-struct EvpCipherCtxDeleter {
-    void operator()(EVP_CIPHER_CTX* ctx) const {
-        EVP_CIPHER_CTX_free(ctx);
-    }
-};
-
-using EvpCipherCtxPtr = std::unique_ptr<EVP_CIPHER_CTX, EvpCipherCtxDeleter>;
-
 class ByteReader {
 public:
     ByteReader(const uint8_t* data, size_t size) : data_(data), size_(size) {
         if (data == nullptr && size != 0) {
-            throw std::runtime_error("embedded encrypted model pointer is null");
+            throw std::runtime_error("embedded model pointer is null");
         }
     }
 
     const uint8_t* read_bytes(size_t n, const std::string& what) {
         if (offset_ > size_ || n > size_ - offset_) {
             std::ostringstream oss;
-            oss << "truncated embedded encrypted model while reading " << what;
+            oss << "truncated embedded model while reading " << what;
             throw std::runtime_error(oss.str());
         }
         const uint8_t* out = data_ + offset_;
@@ -224,42 +196,42 @@ private:
     size_t offset_{0};
 };
 
-struct EncryptedModelView {
-    const uint8_t* nonce{nullptr};
-    size_t nonce_size{0};
-    const uint8_t* ciphertext_and_tag{nullptr};
-    size_t ciphertext_and_tag_size{0};
-};
+bool has_magic(const uint8_t* data, size_t size, const uint8_t (&magic)[8]) {
+    return size >= sizeof(magic) && std::memcmp(data, magic, sizeof(magic)) == 0;
+}
 
-EncryptedModelView parse_embedded_encrypted_model() {
-    const uint8_t* pack = embedded_encrypted_model_data();
-    const size_t pack_size = embedded_encrypted_model_size();
-    if (pack == nullptr || pack_size == 0) {
-        throw std::runtime_error("embedded encrypted model is empty");
-    }
-
+EncryptedModelView parse_embedded_encrypted_model(const uint8_t* pack, size_t pack_size) {
     ByteReader reader(pack, pack_size);
     const uint8_t* magic = reader.read_bytes(8, "magic");
-    if (std::memcmp(magic, kEncryptedModelMagic, sizeof(kEncryptedModelMagic)) != 0) {
-        throw std::runtime_error("invalid embedded encrypted model magic");
+    if (std::memcmp(magic, kEncryptedModelMagicV2, sizeof(kEncryptedModelMagicV2)) != 0) {
+        throw std::runtime_error("invalid embedded AES-GCM model magic");
+    }
+
+    const uint32_t algorithm_id = reader.read_u32("algorithm_id");
+    if (algorithm_id != kAes128GcmAlgorithmId) {
+        throw std::runtime_error("unsupported encrypted model algorithm id: " + std::to_string(algorithm_id));
     }
 
     const uint32_t nonce_size = reader.read_u32("nonce_len");
+    if (nonce_size != kGcmNonceBytes) {
+        std::ostringstream oss;
+        oss << "gcm-aes-128 nonce must be exactly " << kGcmNonceBytes
+            << " bytes, got " << nonce_size;
+        throw std::runtime_error(oss.str());
+    }
     const uint8_t* nonce = reader.read_bytes(nonce_size, "nonce");
+
     const uint64_t ciphertext_size_u64 = reader.read_u64("ciphertext_len");
     if (ciphertext_size_u64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
         throw std::runtime_error("embedded ciphertext length overflows size_t");
     }
     const size_t ciphertext_size = static_cast<size_t>(ciphertext_size_u64);
+    if (ciphertext_size < kGcmTagBytes) {
+        throw std::runtime_error("AES-128-GCM ciphertext must include a 16-byte authentication tag");
+    }
     const uint8_t* ciphertext_and_tag = reader.read_bytes(ciphertext_size, "ciphertext_and_tag");
     if (reader.remaining() != 0) {
-        throw std::runtime_error("embedded encrypted model has trailing bytes");
-    }
-    if (nonce_size != 12) {
-        throw std::runtime_error("embedded AES-GCM nonce must be exactly 12 bytes");
-    }
-    if (ciphertext_size <= 16) {
-        throw std::runtime_error("embedded ciphertext must include a 16-byte GCM tag");
+        throw std::runtime_error("embedded AES-GCM model has trailing bytes");
     }
 
     return EncryptedModelView{
@@ -267,48 +239,52 @@ EncryptedModelView parse_embedded_encrypted_model() {
         nonce_size,
         ciphertext_and_tag,
         ciphertext_size,
+        pack_size,
     };
 }
 
-std::vector<uint8_t> decrypt_embedded_model() {
-    const EncryptedModelView encrypted_model = parse_embedded_encrypted_model();
+int checked_int_size(size_t value, const std::string& name) {
+    if (value > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error(name + " is too large for OpenSSL EVP");
+    }
+    return static_cast<int>(value);
+}
+
+std::vector<uint8_t> decrypt_aes_128_gcm(const EncryptedModelView& encrypted_model) {
+    init_openssl_crypto();
+
+    std::array<uint8_t, kAes128KeyBytes> key{};
+    pt2so_materialize_aes_128_key(key.data(), key.size());
+
     const uint8_t* encrypted = encrypted_model.ciphertext_and_tag;
     const size_t encrypted_size = encrypted_model.ciphertext_and_tag_size;
-    std::vector<uint8_t> key = load_runtime_key();
-    const uint8_t* nonce = encrypted_model.nonce;
-    const size_t nonce_size = encrypted_model.nonce_size;
-
-    if (key.size() != 32) {
-        throw std::runtime_error("runtime AES-256-GCM key must be exactly 32 bytes");
-    }
-    if (encrypted_size - 16 > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        OPENSSL_cleanse(key.data(), key.size());
-        throw std::runtime_error("embedded encrypted model is too large for OpenSSL EVP");
-    }
-
-    const size_t ciphertext_size = encrypted_size - 16;
+    const size_t ciphertext_size = encrypted_size - kGcmTagBytes;
     const uint8_t* tag = encrypted + ciphertext_size;
 
     EvpCipherCtxPtr ctx(EVP_CIPHER_CTX_new());
     if (!ctx) {
-        OPENSSL_cleanse(key.data(), key.size());
+        secure_clear(key.data(), key.size());
         throw std::runtime_error("failed to allocate OpenSSL EVP_CIPHER_CTX");
     }
 
-    if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) {
-        OPENSSL_cleanse(key.data(), key.size());
-        throw std::runtime_error("OpenSSL EVP_DecryptInit_ex failed");
-    }
-    if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce_size), nullptr) != 1) {
-        OPENSSL_cleanse(key.data(), key.size());
-        throw std::runtime_error("OpenSSL failed to set AES-GCM nonce length");
-    }
-    if (EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), nonce) != 1) {
-        OPENSSL_cleanse(key.data(), key.size());
-        throw std::runtime_error("OpenSSL failed to initialize AES-GCM key and nonce");
-    }
+    auto fail_with_key_clear = [&](const std::string& message) {
+        secure_clear(key.data(), key.size());
+        throw std::runtime_error(message);
+    };
 
-    OPENSSL_cleanse(key.data(), key.size());
+    if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_128_gcm(), nullptr, nullptr, nullptr) != 1) {
+        fail_with_key_clear("OpenSSL AES-128-GCM decrypt init failed");
+    }
+    if (EVP_CIPHER_CTX_ctrl(
+            ctx.get(),
+            EVP_CTRL_GCM_SET_IVLEN,
+            checked_int_size(encrypted_model.nonce_size, "nonce"),
+            nullptr) != 1) {
+        fail_with_key_clear("OpenSSL failed to set AES-128-GCM nonce length");
+    }
+    if (EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), encrypted_model.nonce) != 1) {
+        fail_with_key_clear("OpenSSL failed to initialize AES-128-GCM key and nonce");
+    }
 
     int out_len = 0;
     if (EVP_DecryptUpdate(
@@ -317,7 +293,7 @@ std::vector<uint8_t> decrypt_embedded_model() {
             &out_len,
             kAad,
             static_cast<int>(sizeof(kAad) - 1)) != 1) {
-        throw std::runtime_error("OpenSSL failed to authenticate AES-GCM AAD");
+        fail_with_key_clear("OpenSSL failed to authenticate AES-128-GCM AAD");
     }
 
     std::vector<uint8_t> plaintext(ciphertext_size);
@@ -327,24 +303,65 @@ std::vector<uint8_t> decrypt_embedded_model() {
             plaintext.data(),
             &out_len,
             encrypted,
-            static_cast<int>(ciphertext_size)) != 1) {
-        OPENSSL_cleanse(plaintext.data(), plaintext.size());
-        throw std::runtime_error("OpenSSL AES-GCM decrypt update failed");
+            checked_int_size(ciphertext_size, "ciphertext")) != 1) {
+        secure_clear(plaintext);
+        fail_with_key_clear("OpenSSL AES-128-GCM decrypt update failed");
     }
     plaintext_len += out_len;
 
-    if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, 16, const_cast<uint8_t*>(tag)) != 1) {
-        OPENSSL_cleanse(plaintext.data(), plaintext.size());
-        throw std::runtime_error("OpenSSL failed to set AES-GCM tag");
+    if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, kGcmTagBytes, const_cast<uint8_t*>(tag)) != 1) {
+        secure_clear(plaintext);
+        fail_with_key_clear("OpenSSL failed to set AES-128-GCM tag");
     }
 
     if (EVP_DecryptFinal_ex(ctx.get(), plaintext.data() + plaintext_len, &out_len) != 1) {
-        OPENSSL_cleanse(plaintext.data(), plaintext.size());
-        throw std::runtime_error("embedded model authentication failed");
+        secure_clear(plaintext);
+        fail_with_key_clear("embedded model authentication failed");
     }
     plaintext_len += out_len;
     plaintext.resize(static_cast<size_t>(plaintext_len));
+    secure_clear(key.data(), key.size());
     return plaintext;
+}
+
+ModelBlob load_embedded_model_blob() {
+    const uint8_t* embedded_model = embedded_encrypted_model_data();
+    const size_t embedded_model_size = embedded_encrypted_model_size();
+    if (embedded_model == nullptr || embedded_model_size == 0) {
+        throw std::runtime_error("embedded model blob is empty");
+    }
+
+    if (has_magic(embedded_model, embedded_model_size, kPlaintextModelMagicV1)) {
+        ByteReader reader(embedded_model, embedded_model_size);
+        (void)reader.read_bytes(8, "plaintext magic");
+        const uint64_t plaintext_size_u64 = reader.read_u64("plaintext_len");
+        if (plaintext_size_u64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            throw std::runtime_error("embedded plaintext length overflows size_t");
+        }
+        const size_t plaintext_size = static_cast<size_t>(plaintext_size_u64);
+        const uint8_t* plaintext = reader.read_bytes(plaintext_size, "plaintext TorchScript model");
+        if (reader.remaining() != 0) {
+            throw std::runtime_error("embedded plaintext model has trailing bytes");
+        }
+
+        ModelBlob result;
+        result.algorithm = "plaintext-embedded";
+        result.encrypted = false;
+        result.encrypted_pack_bytes = 0;
+        result.plaintext_bytes = plaintext_size;
+        result.plaintext.assign(plaintext, plaintext + plaintext_size);
+        return result;
+    }
+
+    const EncryptedModelView encrypted_model = parse_embedded_encrypted_model(embedded_model, embedded_model_size);
+
+    ModelBlob result;
+    result.algorithm = "gcm-aes-128";
+    result.encrypted = true;
+    result.encrypted_pack_bytes = encrypted_model.pack_size;
+    result.plaintext = decrypt_aes_128_gcm(encrypted_model);
+    result.plaintext_bytes = result.plaintext.size();
+    return result;
 }
 
 std::unique_ptr<torch::jit::Module> load_jit_model_from_memory(const std::vector<uint8_t>& model_bytes) {
@@ -354,10 +371,15 @@ std::unique_ptr<torch::jit::Module> load_jit_model_from_memory(const std::vector
         auto module = std::make_unique<torch::jit::Module>(
             torch::jit::load(model_stream, torch::Device(torch::kCPU)));
         module->eval();
-        OPENSSL_cleanse(model_string.data(), model_string.size());
+        secure_clear(model_string);
         return module;
+    } catch (const std::exception& e) {
+        secure_clear(model_string);
+        throw std::runtime_error(
+            std::string("torch::jit::load failed after AES-GCM decrypt; embedded key or blob may be corrupt: ") +
+            e.what());
     } catch (...) {
-        OPENSSL_cleanse(model_string.data(), model_string.size());
+        secure_clear(model_string);
         throw;
     }
 }
@@ -372,16 +394,30 @@ int model_create(ModelHandle* out_handle) {
     }
     *out_handle = nullptr;
 
+    const auto total_start = Clock::now();
     try {
         auto ctx = std::make_unique<ModelContext>();
-        std::vector<uint8_t> decrypted_model = decrypt_embedded_model();
+
+        const auto decrypt_start = Clock::now();
+        ModelBlob model_blob = load_embedded_model_blob();
+        const auto decrypt_end = Clock::now();
+
+        const auto load_start = Clock::now();
         try {
-            ctx->model = load_jit_model_from_memory(decrypted_model);
+            ctx->model = load_jit_model_from_memory(model_blob.plaintext);
         } catch (...) {
-            OPENSSL_cleanse(decrypted_model.data(), decrypted_model.size());
+            secure_clear(model_blob.plaintext);
             throw;
         }
-        OPENSSL_cleanse(decrypted_model.data(), decrypted_model.size());
+        const auto load_end = Clock::now();
+        secure_clear(model_blob.plaintext);
+
+        ctx->create_timing.algorithm = model_blob.algorithm;
+        ctx->create_timing.encrypted_bytes = model_blob.encrypted_pack_bytes;
+        ctx->create_timing.plaintext_bytes = model_blob.plaintext_bytes;
+        ctx->create_timing.decrypt_ms = model_blob.encrypted ? elapsed_ms(decrypt_start, decrypt_end) : 0.0;
+        ctx->create_timing.jit_load_ms = elapsed_ms(load_start, load_end);
+        ctx->create_timing.total_ms = elapsed_ms(total_start, Clock::now());
         ctx->last_error.clear();
 
         *out_handle = reinterpret_cast<ModelHandle>(ctx.release());
@@ -505,8 +541,22 @@ const char* model_last_error(ModelHandle handle) {
     return ctx->last_error.c_str();
 }
 
+int model_last_create_timing(ModelHandle handle, ModelCreateTiming* out_timing) {
+    ModelContext* ctx = as_context(handle);
+    if (ctx == nullptr || out_timing == nullptr) {
+        return -1;
+    }
+    out_timing->algorithm = ctx->create_timing.algorithm.c_str();
+    out_timing->encrypted_bytes = ctx->create_timing.encrypted_bytes;
+    out_timing->plaintext_bytes = ctx->create_timing.plaintext_bytes;
+    out_timing->decrypt_ms = ctx->create_timing.decrypt_ms;
+    out_timing->jit_load_ms = ctx->create_timing.jit_load_ms;
+    out_timing->total_ms = ctx->create_timing.total_ms;
+    return 0;
+}
+
 const char* model_version() {
-    return "pt2so-factor-mlp/0.2.0-torchscript";
+    return "pt2so-factor-mlp/0.7.0-gcm-aes-128-embedded-obfuscated-key";
 }
 
 }

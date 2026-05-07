@@ -29,6 +29,15 @@ struct TensorDesc {
     size_t bytes;
 };
 
+struct ModelCreateTiming {
+    const char* algorithm;
+    size_t encrypted_bytes;
+    size_t plaintext_bytes;
+    double decrypt_ms;
+    double jit_load_ms;
+    double total_ms;
+};
+
 MODEL_API_EXPORT int model_create(ModelHandle* out_handle);
 
 MODEL_API_EXPORT int model_forward(
@@ -41,6 +50,8 @@ MODEL_API_EXPORT int model_forward(
 MODEL_API_EXPORT void model_destroy(ModelHandle handle);
 
 MODEL_API_EXPORT const char* model_last_error(ModelHandle handle);
+
+MODEL_API_EXPORT int model_last_create_timing(ModelHandle handle, struct ModelCreateTiming* out_timing);
 
 MODEL_API_EXPORT const char* model_version();
 
