@@ -74,6 +74,7 @@ if(PT2SO_BUILD_MODEL_LIB)
         ${PT2SO_BLOB_SOURCE}
         ${PT2SO_KEY_SOURCE}
         src/model_api.cpp
+        src/model_session.cpp
     )
 
     target_include_directories(model
