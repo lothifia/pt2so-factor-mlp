@@ -47,8 +47,8 @@ public:
         return *this;
     }
 
-    size_t insert(std::vector<std::vector<T>> rows) {
-        if (rows.empty()) {
+    size_t insert(std::vector<std::vector<T>> columns) {
+        if (columns.empty()) {
             return 0;
         }
 
@@ -56,19 +56,27 @@ public:
         if (!state) {
             throw std::runtime_error("DataSource has no state");
         }
-        const int64_t rows_count = static_cast<int64_t>(rows.size());
         const int64_t hidden = state->model_hidden;
-
-        std::vector<T> flat;
-        flat.reserve(checked_element_count(rows_count, hidden));
-        for (auto& row : rows) {
-            if (static_cast<int64_t>(row.size()) != hidden) {
-                throw std::runtime_error("DataSource::insert expects rows shaped [rows, hidden]");
+        if (static_cast<int64_t>(columns.size()) != hidden) {
+            throw std::runtime_error("DataSource::insert expects columns shaped [hidden, rows]");
+        }
+        const int64_t rows_count = static_cast<int64_t>(columns.front().size());
+        for (const auto& column : columns) {
+            if (static_cast<int64_t>(column.size()) != rows_count) {
+                throw std::runtime_error("DataSource::insert expects columns shaped [hidden, rows]");
             }
-            flat.insert(
-                flat.end(),
-                std::make_move_iterator(row.begin()),
-                std::make_move_iterator(row.end()));
+        }
+        if (rows_count == 0) {
+            return 0;
+        }
+
+        std::vector<T> flat(checked_element_count(rows_count, hidden));
+        for (int64_t h = 0; h < hidden; ++h) {
+            auto& column = columns[static_cast<size_t>(h)];
+            for (int64_t row = 0; row < rows_count; ++row) {
+                flat[static_cast<size_t>(row) * static_cast<size_t>(hidden) + static_cast<size_t>(h)] =
+                    std::move(columns[static_cast<size_t>(h)][static_cast<size_t>(row)]);
+            }
         }
 
         bool should_notify = false;

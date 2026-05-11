@@ -31,16 +31,17 @@ void test_accumulates_rows_until_target_batch_ready() {
     pt2so::DataSource<float> ds(/*model_hidden=*/3, /*target_rows=*/4);
 
     const size_t inserted = ds.insert({
-        {0.0f, 10.0f, 20.0f},
-        {1.0f, 11.0f, 21.0f},
+        {0.0f, 1.0f},
+        {10.0f, 11.0f},
+        {20.0f, 21.0f},
     });
     assert(inserted == 2);
     assert(!ds.try_get_batch().has_value());
 
     ds.insert({
-        {2.0f, 12.0f, 22.0f},
-        {3.0f, 13.0f, 23.0f},
-        {4.0f, 14.0f, 24.0f},
+        {2.0f, 3.0f, 4.0f},
+        {12.0f, 13.0f, 14.0f},
+        {22.0f, 23.0f, 24.0f},
     });
 
     auto batch = ds.try_get_batch();
@@ -58,9 +59,9 @@ void test_accumulates_rows_until_target_batch_ready() {
     assert(!ds.try_get_batch().has_value());
 
     ds.insert({
-        {5.0f, 15.0f, 25.0f},
-        {6.0f, 16.0f, 26.0f},
-        {7.0f, 17.0f, 27.0f},
+        {5.0f, 6.0f, 7.0f},
+        {15.0f, 16.0f, 17.0f},
+        {25.0f, 26.0f, 27.0f},
     });
 
     auto second = ds.try_get_batch();
@@ -78,11 +79,8 @@ void test_insert_can_exceed_target_rows() {
     pt2so::DataSource<float> ds(/*model_hidden=*/2, /*target_rows=*/3);
 
     ds.insert({
-        {0.0f, 10.0f},
-        {1.0f, 11.0f},
-        {2.0f, 12.0f},
-        {3.0f, 13.0f},
-        {4.0f, 14.0f},
+        {0.0f, 1.0f, 2.0f, 3.0f, 4.0f},
+        {10.0f, 11.0f, 12.0f, 13.0f, 14.0f},
     });
 
     auto first = ds.try_get_batch();
@@ -115,13 +113,14 @@ void test_get_batch_async_waits_for_target_rows() {
     assert(fut.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
 
     ds.insert({
-        {1.0f, 4.0f},
-        {2.0f, 5.0f},
+        {1.0f, 2.0f},
+        {4.0f, 5.0f},
     });
     assert(fut.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
 
     ds.insert({
-        {3.0f, 6.0f},
+        {3.0f},
+        {6.0f},
     });
 
     auto batch = fut.get();
@@ -139,8 +138,8 @@ void test_close_returns_partial_last_batch() {
     pt2so::DataSource<float> ds(/*model_hidden=*/2, /*target_rows=*/4);
 
     ds.insert({
-        {1.0f, 3.0f},
-        {2.0f, 4.0f},
+        {1.0f, 2.0f},
+        {3.0f, 4.0f},
     });
     assert(!ds.try_get_batch().has_value());
 
@@ -164,8 +163,8 @@ void test_close_marks_exact_final_batch() {
     pt2so::DataSource<float> ds(/*model_hidden=*/2, /*target_rows=*/2);
 
     ds.insert({
-        {1.0f, 3.0f},
-        {2.0f, 4.0f},
+        {1.0f, 2.0f},
+        {3.0f, 4.0f},
     });
     ds.close();
 
@@ -184,7 +183,8 @@ void test_close_wakes_async_waiter() {
 
     auto fut = ds.get_batch_async();
     ds.insert({
-        {1.0f, 2.0f},
+        {1.0f},
+        {2.0f},
     });
     ds.close();
 
@@ -221,10 +221,13 @@ void test_invalid_inputs_throw() {
     expect_throws([&] {
         ds.insert({{1.0f}});
     });
+    expect_throws([&] {
+        ds.insert({{1.0f, 2.0f}, {3.0f}});
+    });
 
     ds.close();
     expect_throws([&] {
-        ds.insert({{1.0f, 2.0f}});
+        ds.insert({{1.0f}, {2.0f}});
     });
 }
 
